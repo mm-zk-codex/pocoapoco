@@ -334,6 +334,18 @@ async def setup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "<b>PocoAPoco commands</b>\n\n"
+        "/start — restart the bot or say hello again\n"
+        "/setup — change your topics or daily message time\n"
+        "/stats — see your progress (days active, streak, Spanish words seen)\n"
+        "/help — show this message\n\n"
+        "Otherwise just <b>type anything</b> and we'll chat! 💬",
+        parse_mode="HTML",
+    )
+
+
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -388,6 +400,13 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def post_init(application: Application) -> None:
     await init_db()
     setup_scheduler(application)
+    from telegram import BotCommand
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start or restart the bot"),
+        BotCommand("setup", "Change your topics or daily message time"),
+        BotCommand("stats", "See your progress"),
+        BotCommand("help", "Show available commands"),
+    ])
     logger.info("Bot ready")
 
 
@@ -407,6 +426,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("setup", setup_handler))
+    app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
