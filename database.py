@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     daily_time_set INTEGER NOT NULL DEFAULT 0,
     timezone TEXT DEFAULT 'UTC',
     premium INTEGER NOT NULL DEFAULT 0,
+    premium_expires_at TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_active TIMESTAMP
 );
@@ -53,6 +54,11 @@ async def init_db():
                 "ALTER TABLE users ADD COLUMN premium INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("Migration: added users.premium")
+        if "premium_expires_at" not in cols:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN premium_expires_at TEXT"
+            )
+            logger.info("Migration: added users.premium_expires_at")
         await db.commit()
     logger.info("Database initialized")
 
@@ -145,6 +151,15 @@ async def set_user_premium(telegram_id: int, value: bool) -> None:
         await db.execute(
             "UPDATE users SET premium = ? WHERE telegram_id = ?",
             (1 if value else 0, telegram_id),
+        )
+        await db.commit()
+
+
+async def set_user_premium_expires(telegram_id: int, expires_at: str | None) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE users SET premium_expires_at = ? WHERE telegram_id = ?",
+            (expires_at, telegram_id),
         )
         await db.commit()
 

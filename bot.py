@@ -4,19 +4,25 @@ import logging
 import random
 import signal
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
-from config import INVITE_CODE, LOG_LEVEL, TELEGRAM_BOT_TOKEN
+from config import (
+    INVITE_CODE,
+    LOG_LEVEL,
+    PREMIUM_PRICE_STARS_PER_WEEK,
+    TELEGRAM_BOT_TOKEN,
+)
 from conversation import (
     build_system_prompt,
     call_llm,
@@ -32,6 +38,7 @@ from database import (
     get_user_stats,
     init_db,
     set_user_premium,
+    set_user_premium_expires,
     update_last_active,
     update_user_daily_time,
     update_user_interests,
@@ -264,9 +271,16 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         daily_line = "Daily check-in: <i>not set yet</i> — type /setup to pick"
 
-    is_premium = bool(db_user.get("premium"))
-    if is_premium:
-        premium_line = "Premium: ✅ ON"
+    if is_premium_active(db_user):
+        expires_at = db_user.get("premium_expires_at")
+        if PREMIUM_PRICE_STARS_PER_WEEK > 0 and expires_at:
+            try:
+                exp_str = datetime.fromisoformat(expires_at).strftime("%Y-%m-%d")
+                premium_line = f"Premium: ✅ ON (renews around {exp_str})"
+            except ValueError:
+                premium_line = "Premium: ✅ ON"
+        else:
+            premium_line = "Premium: ✅ ON"
     else:
         feature_names = ", ".join(f[1] for f in PREMIUM_FEATURES)
         premium_line = (
@@ -356,18 +370,68 @@ async def setup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-def _premium_text(is_premium: bool) -> str:
-    if is_premium:
-        header = "✅ <b>Premium is ON</b> (beta — enjoy the ride!)\n\nYou have access to:\n"
-        lines = [f"  {e} <b>{name}</b> — {desc}" for e, name, desc in PREMIUM_FEATURES]
-        footer = "\n\nTap below if you want to turn it off."
-        button_label = "Disable Premium"
+PREMIUM_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60  # Telegram Stars subs are 30 days
+PREMIUM_PAYLOAD_PREFIX = "premium_sub:"
+
+
+def is_premium_active(db_user: dict) -> bool:
+    if not db_user.get("premium"):
+        return False
+    expires_at = db_user.get("premium_expires_at")
+    if not expires_at:
+        # Free-toggle path (or grandfathered beta user) — no expiry tracking.
+        return True
+    try:
+        return datetime.now() < datetime.fromisoformat(expires_at)
+    except ValueError:
+        return True  # malformed timestamp — fail open rather than yank access
+
+
+def _features_block() -> str:
+    return "\n".join(f"  {e} <b>{name}</b> — {desc}" for e, name, desc in PREMIUM_FEATURES)
+
+
+def _premium_text_free(is_active: bool) -> tuple[str, str]:
+    """Free-during-beta UX: simple toggle."""
+    if is_active:
+        return (
+            "✅ <b>Premium is ON</b> (beta — enjoy the ride!)\n\n"
+            "You have access to:\n" + _features_block() +
+            "\n\nTap below if you want to turn it off."
+        ), "Disable Premium"
+    return (
+        "🔒 <b>Premium is OFF</b>\n\n"
+        "Unlock these features:\n" + _features_block() +
+        "\n\nTap below to enable (free during beta)."
+    ), "Enable Premium ✨"
+
+
+def _premium_text_paid_off() -> str:
+    weekly = PREMIUM_PRICE_STARS_PER_WEEK
+    monthly = weekly * 4
+    return (
+        "🔒 <b>Premium is OFF</b>\n\n"
+        "Unlock these features:\n" + _features_block() +
+        f"\n\n<b>{weekly}⭐ / week</b> — billed every 30 days as <b>{monthly}⭐</b> "
+        "via Telegram Stars. Tap the invoice below to subscribe."
+    )
+
+
+def _premium_text_paid_on(expires_at: str | None) -> str:
+    if expires_at:
+        try:
+            exp_str = datetime.fromisoformat(expires_at).strftime("%Y-%m-%d")
+            until = (
+                f"\n\nActive until <b>{exp_str}</b> — Telegram handles renewals.\n"
+                "Manage your subscription in Telegram → Settings → My Stars."
+            )
+        except ValueError:
+            until = "\n\nManage your subscription in Telegram → Settings → My Stars."
     else:
-        header = "🔒 <b>Premium is OFF</b>\n\nUnlock these features:\n"
-        lines = [f"  {e} <b>{name}</b> — {desc}" for e, name, desc in PREMIUM_FEATURES]
-        footer = "\n\nTap below to enable (free during beta)."
-        button_label = "Enable Premium ✨"
-    return header + "\n".join(lines) + footer, button_label
+        until = "\n\nGranted during the beta. Enjoy!"
+    return (
+        "✅ <b>Premium is ON</b>\n\nYou have access to:\n" + _features_block() + until
+    )
 
 
 async def premium_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -380,12 +444,63 @@ async def premium_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    is_premium = bool(db_user.get("premium"))
-    text, button_label = _premium_text(is_premium)
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(button_label, callback_data="premium_toggle")]]
+    is_active = is_premium_active(db_user)
+
+    if PREMIUM_PRICE_STARS_PER_WEEK <= 0:
+        text, button_label = _premium_text_free(is_active)
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(button_label, callback_data="premium_toggle")]]
+        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    if is_active:
+        text = _premium_text_paid_on(db_user.get("premium_expires_at"))
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    await update.message.reply_text(_premium_text_paid_off(), parse_mode="HTML")
+    monthly_price = PREMIUM_PRICE_STARS_PER_WEEK * 4
+    await update.message.reply_invoice(
+        title="PocoAPoco Premium",
+        description=(
+            "Unlock premium features for 30 days. Auto-renews via Telegram Stars; "
+            "cancel anytime in Telegram → Settings → My Stars."
+        ),
+        payload=f"{PREMIUM_PAYLOAD_PREFIX}{telegram_id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice("PocoAPoco Premium (30 days)", monthly_price)],
+        subscription_period=PREMIUM_SUBSCRIPTION_PERIOD_SECONDS,
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if not query.invoice_payload.startswith(PREMIUM_PAYLOAD_PREFIX):
+        await query.answer(ok=False, error_message="Unknown payment.")
+        return
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
+    if not payment or not payment.invoice_payload.startswith(PREMIUM_PAYLOAD_PREFIX):
+        return
+    telegram_id = update.effective_user.id
+    # Add a 2-day grace buffer so the next renewal lands before we expire them.
+    expires_at = (datetime.now() + timedelta(days=32)).isoformat()
+    await set_user_premium(telegram_id, True)
+    await set_user_premium_expires(telegram_id, expires_at)
+    logger.info(
+        f"Premium activated/renewed for {telegram_id}: "
+        f"paid {payment.total_amount}⭐, valid until {expires_at}"
+    )
+    await update.message.reply_text(
+        "🎉 <b>¡Gracias!</b> Premium is active. Telegram will renew it automatically every "
+        "30 days — manage your subscription in Telegram → Settings → My Stars.",
+        parse_mode="HTML",
+    )
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -452,12 +567,20 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     elif data == "premium_toggle":
+        # Free toggle is only valid in beta-free mode. In paid mode this button
+        # shouldn't have been shown — refuse on stale buttons after a price change.
+        if PREMIUM_PRICE_STARS_PER_WEEK > 0:
+            await query.answer(
+                "Premium is now a paid subscription — type /premium.",
+                show_alert=True,
+            )
+            return
         db_user = await get_user(telegram_id)
         if db_user is None:
             return
         new_value = not bool(db_user.get("premium"))
         await set_user_premium(telegram_id, new_value)
-        text, button_label = _premium_text(new_value)
+        text, button_label = _premium_text_free(new_value)
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(button_label, callback_data="premium_toggle")]]
         )
@@ -497,6 +620,8 @@ def main() -> None:
     app.add_handler(CommandHandler("premium", premium_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     logger.info("Starting PocoAPoco bot (polling)...")
