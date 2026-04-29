@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
     daily_time TEXT DEFAULT '08:00',
     daily_time_set INTEGER NOT NULL DEFAULT 0,
     timezone TEXT DEFAULT 'UTC',
+    premium INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_active TIMESTAMP
 );
@@ -47,6 +48,11 @@ async def init_db():
                 "ALTER TABLE users ADD COLUMN daily_time_set INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("Migration: added users.daily_time_set")
+        if "premium" not in cols:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN premium INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migration: added users.premium")
         await db.commit()
     logger.info("Database initialized")
 
@@ -132,6 +138,15 @@ async def get_users_for_time(current_time: str) -> list[dict]:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def set_user_premium(telegram_id: int, value: bool) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE users SET premium = ? WHERE telegram_id = ?",
+            (1 if value else 0, telegram_id),
+        )
+        await db.commit()
 
 
 async def update_last_active(telegram_id: int):

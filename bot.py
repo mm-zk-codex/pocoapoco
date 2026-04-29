@@ -31,6 +31,7 @@ from database import (
     get_user,
     get_user_stats,
     init_db,
+    set_user_premium,
     update_last_active,
     update_user_daily_time,
     update_user_interests,
@@ -77,6 +78,13 @@ TIMES = [
     ("🌙 Night (21:00)", "21:00"),
 ]
 _VALID_TIMES = {value for _, value in TIMES}
+
+# Each entry: (emoji, name, one-line description)
+PREMIUM_FEATURES = [
+    ("📰", "News fetching", "daily topics pulled from real news instead of a curated list"),
+    ("📚", "Vocabulary tracking", "every Spanish word you encounter is saved to your personal list"),
+    ("🔁", "Spaced repetition", "get quizzed on your vocab at just the right time"),
+]
 
 
 def _check_rate_limit(user_id: int) -> bool:
@@ -256,6 +264,16 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         daily_line = "Daily check-in: <i>not set yet</i> — type /setup to pick"
 
+    is_premium = bool(db_user.get("premium"))
+    if is_premium:
+        premium_line = "Premium: ✅ ON"
+    else:
+        feature_names = ", ".join(f[1] for f in PREMIUM_FEATURES)
+        premium_line = (
+            f"Premium: OFF — <i>{feature_names} disabled</i>\n"
+            "  → /premium to unlock"
+        )
+
     if stats["total_user_messages"] == 0:
         lines = [
             f"¡Hola, {name}! No <b>conversaciones</b> yet — say something and "
@@ -263,6 +281,8 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "",
             interests_line,
             daily_line,
+            "",
+            premium_line,
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
@@ -286,6 +306,8 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "",
         interests_line,
         daily_line,
+        "",
+        premium_line,
         "",
         "¡Sigue así! Keep going. 🌱",
     ]
@@ -334,12 +356,45 @@ async def setup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _premium_text(is_premium: bool) -> str:
+    if is_premium:
+        header = "✅ <b>Premium is ON</b> (beta — enjoy the ride!)\n\nYou have access to:\n"
+        lines = [f"  {e} <b>{name}</b> — {desc}" for e, name, desc in PREMIUM_FEATURES]
+        footer = "\n\nTap below if you want to turn it off."
+        button_label = "Disable Premium"
+    else:
+        header = "🔒 <b>Premium is OFF</b>\n\nUnlock these features:\n"
+        lines = [f"  {e} <b>{name}</b> — {desc}" for e, name, desc in PREMIUM_FEATURES]
+        footer = "\n\nTap below to enable (free during beta)."
+        button_label = "Enable Premium ✨"
+    return header + "\n".join(lines) + footer, button_label
+
+
+async def premium_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    db_user = await get_user(telegram_id)
+    if db_user is None:
+        await update.message.reply_text(
+            "You'll need an invite first. Send <code>/start your-invite-code</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    is_premium = bool(db_user.get("premium"))
+    text, button_label = _premium_text(is_premium)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(button_label, callback_data="premium_toggle")]]
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>PocoAPoco commands</b>\n\n"
         "/start — restart the bot or say hello again\n"
         "/setup — change your topics or daily message time\n"
         "/stats — see your progress (days active, streak, Spanish words seen)\n"
+        "/premium — enable or disable premium features\n"
         "/help — show this message\n\n"
         "Otherwise just <b>type anything</b> and we'll chat! 💬",
         parse_mode="HTML",
@@ -396,6 +451,18 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
         )
 
+    elif data == "premium_toggle":
+        db_user = await get_user(telegram_id)
+        if db_user is None:
+            return
+        new_value = not bool(db_user.get("premium"))
+        await set_user_premium(telegram_id, new_value)
+        text, button_label = _premium_text(new_value)
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(button_label, callback_data="premium_toggle")]]
+        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
 
 async def post_init(application: Application) -> None:
     await init_db()
@@ -405,6 +472,7 @@ async def post_init(application: Application) -> None:
         BotCommand("start", "Start or restart the bot"),
         BotCommand("setup", "Change your topics or daily message time"),
         BotCommand("stats", "See your progress"),
+        BotCommand("premium", "Manage premium features"),
         BotCommand("help", "Show available commands"),
     ])
     logger.info("Bot ready")
@@ -426,6 +494,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("setup", setup_handler))
+    app.add_handler(CommandHandler("premium", premium_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
