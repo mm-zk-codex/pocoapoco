@@ -89,7 +89,15 @@ async def call_llm(system_prompt: str, history: list[dict]) -> str:
         f"LLM call: tokens={usage.get('total_tokens', '?')}, latency={latency:.2f}s"
     )
 
-    return data["choices"][0]["message"]["content"]
+    choices = data.get("choices") or []
+    content = choices[0].get("message", {}).get("content") if choices else None
+    if not content or not isinstance(content, str):
+        # OpenRouter can return a 200 with null content (refusals, upstream
+        # provider errors, content filtering). Surface as an error so callers
+        # fall back to their generic "try again" message.
+        logger.error(f"LLM returned empty content; raw response: {data!r}")
+        raise RuntimeError("LLM returned empty content")
+    return content
 
 
 def format_for_telegram(text: str) -> str:
