@@ -101,21 +101,10 @@ async def add_message(telegram_id: int, role: str, content: str):
             "INSERT INTO conversations (telegram_id, role, content) VALUES (?, ?, ?)",
             (telegram_id, role, content),
         )
-        # Keep only the last 10 messages per user
-        await db.execute(
-            """DELETE FROM conversations
-               WHERE telegram_id = ? AND id NOT IN (
-                   SELECT id FROM conversations
-                   WHERE telegram_id = ?
-                   ORDER BY created_at DESC
-                   LIMIT 10
-               )""",
-            (telegram_id, telegram_id),
-        )
         await db.commit()
 
 
-async def cleanup_old_messages(days: int = 7):
+async def cleanup_old_messages(days: int = 90):
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(

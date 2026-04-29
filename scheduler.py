@@ -59,7 +59,7 @@ async def _send_to_user(app, user: dict) -> None:
 
 
 async def _daily_cleanup() -> None:
-    await cleanup_old_messages(days=7)
+    await cleanup_old_messages(days=90)
 
 
 def setup_scheduler(app) -> None:
