@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import LOG_LEVEL, TELEGRAM_BOT_TOKEN
+from config import INVITE_CODE, LOG_LEVEL, TELEGRAM_BOT_TOKEN
 from conversation import (
     build_system_prompt,
     call_llm,
@@ -67,6 +67,7 @@ INTERESTS = [
     ("🎵 Music", "Music"),
     ("📰 News", "News & Current Events"),
 ]
+_VALID_INTERESTS = {value for _, value in INTERESTS}
 
 TIMES = [
     ("🌅 Morning (8:00)", "08:00"),
@@ -74,6 +75,7 @@ TIMES = [
     ("🌆 Evening (18:00)", "18:00"),
     ("🌙 Night (21:00)", "21:00"),
 ]
+_VALID_TIMES = {value for _, value in TIMES}
 
 
 def _check_rate_limit(user_id: int) -> bool:
@@ -115,6 +117,15 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     db_user = await get_user(telegram_id)
 
     if db_user is None:
+        provided = context.args[0] if context.args else None
+        if not INVITE_CODE or provided != INVITE_CODE:
+            logger.info(f"Rejected /start from {telegram_id} (invite code mismatch)")
+            await update.message.reply_text(
+                "This bot is invite-only. Tap your invite link, or send "
+                "<code>/start your-invite-code</code> to join.",
+                parse_mode="HTML",
+            )
+            return
         await create_user(telegram_id, tg_user.username, tg_user.first_name)
         await add_message(telegram_id, "assistant", WELCOME_MESSAGE)
         context.user_data["is_new_user"] = True
@@ -152,8 +163,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     db_user = await get_user(telegram_id)
     if db_user is None:
-        await create_user(telegram_id, tg_user.username, tg_user.first_name)
-        db_user = await get_user(telegram_id)
+        await update.message.reply_text(
+            "You'll need an invite to chat. Send "
+            "<code>/start your-invite-code</code> to join.",
+            parse_mode="HTML",
+        )
+        return
 
     await update_last_active(telegram_id)
     await add_message(telegram_id, "user", user_text)
@@ -220,6 +235,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("interest:"):
         topic = data[len("interest:"):]
+        if topic not in _VALID_INTERESTS:
+            logger.warning(f"Rejected interest callback from {telegram_id}: {topic!r}")
+            return
         pending: list[str] = context.user_data.get("pending_interests", [])
         if topic in pending:
             pending.remove(topic)
@@ -233,6 +251,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         if not interests:
             await query.answer("Please select at least one topic!", show_alert=True)
             return
+        # Defense-in-depth: drop anything not in the known set before persisting.
+        interests = [i for i in interests if i in _VALID_INTERESTS]
         await update_user_interests(telegram_id, json.dumps(interests))
         selected_str = ", ".join(interests)
         await query.edit_message_text(f"Great choices! We'll talk about: {selected_str} 🎉")
@@ -244,6 +264,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     elif data.startswith("time:"):
         time_value = data[len("time:"):]
+        if time_value not in _VALID_TIMES:
+            logger.warning(f"Rejected time callback from {telegram_id}: {time_value!r}")
+            return
         await update_user_daily_time(telegram_id, time_value)
         time_labels = {v: l for l, v in TIMES}
         label = time_labels.get(time_value, time_value)
