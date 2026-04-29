@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -131,3 +132,83 @@ async def update_last_active(telegram_id: int):
             (datetime.now().isoformat(), telegram_id),
         )
         await db.commit()
+
+
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_TOKEN_STRIP_RE = re.compile(r"[^\w']", re.UNICODE)
+
+
+def _extract_spanish_words(texts: list[str]) -> set[str]:
+    words: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _BOLD_RE.findall(text):
+            for token in match.split():
+                cleaned = _TOKEN_STRIP_RE.sub("", token).lower()
+                if len(cleaned) >= 2:
+                    words.add(cleaned)
+    return words
+
+
+async def get_user_stats(telegram_id: int) -> dict:
+    """Compute progress stats for a user from stored conversations."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM conversations WHERE telegram_id = ? AND role = 'user'",
+            (telegram_id,),
+        ) as cur:
+            (total_user_messages,) = await cur.fetchone()
+
+        async with db.execute(
+            "SELECT MIN(created_at) FROM conversations WHERE telegram_id = ?",
+            (telegram_id,),
+        ) as cur:
+            (first_seen,) = await cur.fetchone()
+
+        async with db.execute(
+            """SELECT DISTINCT DATE(created_at) FROM conversations
+               WHERE telegram_id = ? AND role = 'user'
+               ORDER BY DATE(created_at) DESC""",
+            (telegram_id,),
+        ) as cur:
+            day_rows = [r[0] for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT content FROM conversations WHERE telegram_id = ? AND role = 'assistant'",
+            (telegram_id,),
+        ) as cur:
+            bot_texts = [r[0] for r in await cur.fetchall()]
+
+    days_chatting = 0
+    if first_seen:
+        try:
+            first_dt = datetime.fromisoformat(first_seen)
+            days_chatting = max(1, (datetime.now() - first_dt).days + 1)
+        except ValueError:
+            days_chatting = 0
+
+    streak = 0
+    if day_rows:
+        today = datetime.now().date()
+        try:
+            dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in day_rows]
+        except ValueError:
+            dates = []
+        if dates and dates[0] in (today, today - timedelta(days=1)):
+            streak = 1
+            for prev, curr in zip(dates, dates[1:]):
+                if prev - curr == timedelta(days=1):
+                    streak += 1
+                else:
+                    break
+
+    spanish_words = _extract_spanish_words(bot_texts)
+
+    return {
+        "total_user_messages": total_user_messages,
+        "days_chatting": days_chatting,
+        "active_days": len(day_rows),
+        "streak": streak,
+        "spanish_words_seen": len(spanish_words),
+    }

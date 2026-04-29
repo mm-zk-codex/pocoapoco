@@ -29,6 +29,7 @@ from database import (
     create_user,
     get_conversation_history,
     get_user,
+    get_user_stats,
     init_db,
     update_last_active,
     update_user_daily_time,
@@ -128,17 +129,15 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         await create_user(telegram_id, tg_user.username, tg_user.first_name)
         await add_message(telegram_id, "assistant", WELCOME_MESSAGE)
-        context.user_data["is_new_user"] = True
-        context.user_data["setup_shown"] = False
         context.user_data["session_exchange_count"] = 0
+        context.user_data.pop("setup_shown", None)
         await update.message.reply_text(
             format_for_telegram(WELCOME_MESSAGE), parse_mode="HTML"
         )
     else:
         await update_last_active(telegram_id)
-        context.user_data["is_new_user"] = False
-        context.user_data["setup_shown"] = True
         context.user_data["session_exchange_count"] = 0
+        context.user_data.pop("setup_shown", None)
         name = db_user.get("first_name") or "amigo"
         greeting = (
             f"¡Hola, {name}! Welcome back! Ready for another <b>conversación</b>? "
@@ -211,9 +210,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await add_message(telegram_id, "assistant", response)
     await update.message.reply_text(format_for_telegram(response), parse_mode="HTML")
 
-    # Show setup buttons to new users after 2 exchanges
+    # Show setup buttons after 2 exchanges to anyone who hasn't picked
+    # interests yet. Derived from the DB so it survives bot restarts.
+    interests_unset = (db_user.get("interests") or "[]") == "[]"
     if (
-        context.user_data.get("is_new_user")
+        interests_unset
         and not context.user_data.get("setup_shown")
         and exchange_count >= 2
     ):
@@ -224,6 +225,52 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "By the way — what topics would you like to chat about? Pick as many as you like!",
             reply_markup=_interests_keyboard([]),
         )
+
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    telegram_id = tg_user.id
+
+    db_user = await get_user(telegram_id)
+    if db_user is None:
+        await update.message.reply_text(
+            "You'll need an invite to chat first. Send "
+            "<code>/start your-invite-code</code> to join.",
+            parse_mode="HTML",
+        )
+        return
+
+    stats = await get_user_stats(telegram_id)
+    name = db_user.get("first_name") or "amigo"
+
+    if stats["total_user_messages"] == 0:
+        await update.message.reply_text(
+            f"¡Hola, {name}! No <b>conversaciones</b> yet — say something and "
+            "your stats will start filling up. 🌱",
+            parse_mode="HTML",
+        )
+        return
+
+    streak = stats["streak"]
+    if streak == 0:
+        streak_line = "Current streak: 0 days — chat today to start a new one!"
+    elif streak == 1:
+        streak_line = "Current streak: 1 day"
+    else:
+        streak_line = f"Current streak: {streak} days 🔥"
+
+    lines = [
+        f"<b>Tu progreso, {name}:</b>",
+        "",
+        f"Days since first chat: {stats['days_chatting']}",
+        f"Active days: {stats['active_days']}",
+        streak_line,
+        f"Messages sent: {stats['total_user_messages']}",
+        f"Spanish <b>palabras</b> you've seen: {stats['spanish_words_seen']}",
+        "",
+        "¡Sigue así! Keep going. 🌱",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -297,6 +344,7 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
