@@ -64,8 +64,12 @@ async def call_llm(system_prompt: str, history: list[dict]) -> str:
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "max_tokens": 300,
+        "max_tokens": 600,
         "temperature": 0.8,
+        # We want short conversational replies, not chain-of-thought.
+        # Reasoning models otherwise burn the whole token budget on thinking
+        # and return content=null with finish_reason=length.
+        "reasoning": {"enabled": False, "exclude": True},
     }
 
     start = datetime.now()
