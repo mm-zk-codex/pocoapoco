@@ -1,0 +1,15 @@
+[Unit]
+Description=PocoAPoco Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=your_username
+WorkingDirectory=/path/to/pocoapoco
+ExecStart=/path/to/pocoapoco/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/path/to/pocoapoco/.env
+
+[Install]
+WantedBy=multi-user.target

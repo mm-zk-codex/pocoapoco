@@ -1,0 +1,285 @@
+import asyncio
+import json
+import logging
+import random
+import signal
+from collections import defaultdict, deque
+from datetime import datetime
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from config import LOG_LEVEL, TELEGRAM_BOT_TOKEN
+from conversation import (
+    build_system_prompt,
+    call_llm,
+    format_for_telegram,
+    get_session_message_count,
+    is_new_session,
+)
+from database import (
+    add_message,
+    create_user,
+    get_conversation_history,
+    get_user,
+    init_db,
+    update_last_active,
+    update_user_daily_time,
+    update_user_interests,
+)
+from scheduler import setup_scheduler
+from topics import TOPICS
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Rate limiting: per-user deque of message timestamps
+_rate_limits: dict[int, deque] = defaultdict(deque)
+RATE_LIMIT_MAX = 20
+RATE_LIMIT_WINDOW = 3600  # seconds
+
+WELCOME_MESSAGE = (
+    "Hey! 👋 I'm PocoAPoco — I help you learn Spanish **poco a poco** (little by little) "
+    "through conversation.\n\n"
+    "Let me show you how it works. Here's a fun one:\n\n"
+    "Did you know that **el café** is one of the most popular drinks in **el mundo**? "
+    "People in Colombia grow some of the **mejor** coffee on the planet. "
+    "**¿Te gusta el café**, or are you more of a tea person?"
+)
+
+INTERESTS = [
+    ("⚽ Sports", "Sports"),
+    ("💻 Tech", "Tech"),
+    ("🎬 Movies & TV", "Movies & TV"),
+    ("🍳 Food & Cooking", "Food & Cooking"),
+    ("✈️ Travel", "Travel"),
+    ("🔬 Science", "Science"),
+    ("🎵 Music", "Music"),
+    ("📰 News", "News & Current Events"),
+]
+
+TIMES = [
+    ("🌅 Morning (8:00)", "08:00"),
+    ("☀️ Midday (12:00)", "12:00"),
+    ("🌆 Evening (18:00)", "18:00"),
+    ("🌙 Night (21:00)", "21:00"),
+]
+
+
+def _check_rate_limit(user_id: int) -> bool:
+    now = datetime.now().timestamp()
+    times = _rate_limits[user_id]
+    while times and times[0] < now - RATE_LIMIT_WINDOW:
+        times.popleft()
+    if len(times) >= RATE_LIMIT_MAX:
+        return False
+    times.append(now)
+    return True
+
+
+def _interests_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    row: list[InlineKeyboardButton] = []
+    for label, value in INTERESTS:
+        prefix = "✅ " if value in selected else ""
+        row.append(InlineKeyboardButton(f"{prefix}{label}", callback_data=f"interest:{value}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Done ✓", callback_data="interests_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _time_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"time:{value}")] for label, value in TIMES]
+    )
+
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    telegram_id = tg_user.id
+
+    db_user = await get_user(telegram_id)
+
+    if db_user is None:
+        await create_user(telegram_id, tg_user.username, tg_user.first_name)
+        await add_message(telegram_id, "assistant", WELCOME_MESSAGE)
+        context.user_data["is_new_user"] = True
+        context.user_data["setup_shown"] = False
+        context.user_data["session_exchange_count"] = 0
+        await update.message.reply_text(
+            format_for_telegram(WELCOME_MESSAGE), parse_mode="HTML"
+        )
+    else:
+        await update_last_active(telegram_id)
+        context.user_data["is_new_user"] = False
+        context.user_data["setup_shown"] = True
+        context.user_data["session_exchange_count"] = 0
+        name = db_user.get("first_name") or "amigo"
+        greeting = (
+            f"¡Hola, {name}! Welcome back! Ready for another <b>conversación</b>? "
+            "What's been on your mind lately? 😊"
+        )
+        await add_message(telegram_id, "assistant", greeting)
+        await update.message.reply_text(greeting, parse_mode="HTML")
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    telegram_id = tg_user.id
+    user_text = update.message.text
+
+    if not _check_rate_limit(telegram_id):
+        await update.message.reply_text(
+            "You're on fire! 🔥 But let's take a quick <b>descanso</b> (break). "
+            "I'll be ready to chat again soon!",
+            parse_mode="HTML",
+        )
+        return
+
+    db_user = await get_user(telegram_id)
+    if db_user is None:
+        await create_user(telegram_id, tg_user.username, tg_user.first_name)
+        db_user = await get_user(telegram_id)
+
+    await update_last_active(telegram_id)
+    await add_message(telegram_id, "user", user_text)
+
+    history = await get_conversation_history(telegram_id)
+
+    # Reset session state when conversation is new
+    new_session = is_new_session(history[:-1])  # exclude the message we just added
+    if new_session or "session_topic" not in context.user_data:
+        interests = json.loads(db_user.get("interests", "[]"))
+        if interests:
+            cat = random.choice(interests)
+            topic = random.choice(TOPICS.get(cat, ["everyday life"]))
+        else:
+            topic = "everyday life and getting to know each other"
+        context.user_data["session_topic"] = topic
+        context.user_data["session_exchange_count"] = 0
+
+    context.user_data["session_exchange_count"] = (
+        context.user_data.get("session_exchange_count", 0) + 1
+    )
+    exchange_count = context.user_data["session_exchange_count"]
+    topic = context.user_data["session_topic"]
+
+    interests = json.loads(db_user.get("interests", "[]"))
+    system_prompt = build_system_prompt(
+        spanish_ratio=int(db_user.get("spanish_ratio", 0.15) * 100),
+        language_level=db_user.get("language_level", "A1"),
+        topic=topic,
+        interests=interests,
+        message_number=exchange_count,
+    )
+
+    try:
+        response = await call_llm(system_prompt, history)
+    except Exception as e:
+        logger.error(f"LLM call failed for user {telegram_id}: {e}")
+        response = "Oops, my **cerebro** is a bit tired right now! Let's try again in a moment. 🧠"
+
+    await add_message(telegram_id, "assistant", response)
+    await update.message.reply_text(format_for_telegram(response), parse_mode="HTML")
+
+    # Show setup buttons to new users after 2 exchanges
+    if (
+        context.user_data.get("is_new_user")
+        and not context.user_data.get("setup_shown")
+        and exchange_count >= 2
+    ):
+        context.user_data["setup_shown"] = True
+        await asyncio.sleep(1)
+        context.user_data["pending_interests"] = []
+        await update.message.reply_text(
+            "By the way — what topics would you like to chat about? Pick as many as you like!",
+            reply_markup=_interests_keyboard([]),
+        )
+
+
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = query.from_user.id
+    data = query.data
+
+    if data.startswith("interest:"):
+        topic = data[len("interest:"):]
+        pending: list[str] = context.user_data.get("pending_interests", [])
+        if topic in pending:
+            pending.remove(topic)
+        else:
+            pending.append(topic)
+        context.user_data["pending_interests"] = pending
+        await query.edit_message_reply_markup(reply_markup=_interests_keyboard(pending))
+
+    elif data == "interests_done":
+        interests: list[str] = context.user_data.get("pending_interests", [])
+        if not interests:
+            await query.answer("Please select at least one topic!", show_alert=True)
+            return
+        await update_user_interests(telegram_id, json.dumps(interests))
+        selected_str = ", ".join(interests)
+        await query.edit_message_text(f"Great choices! We'll talk about: {selected_str} 🎉")
+        await query.message.reply_text(
+            "And when should I message you each day for our <b>conversación</b>?",
+            reply_markup=_time_keyboard(),
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("time:"):
+        time_value = data[len("time:"):]
+        await update_user_daily_time(telegram_id, time_value)
+        time_labels = {v: l for l, v in TIMES}
+        label = time_labels.get(time_value, time_value)
+        await query.edit_message_text(
+            f"Perfect! I'll send you a daily <b>conversación</b> starter at {label}. "
+            "See you <b>mañana</b>! 👋",
+            parse_mode="HTML",
+        )
+
+
+async def post_init(application: Application) -> None:
+    await init_db()
+    setup_scheduler(application)
+    logger.info("Bot ready")
+
+
+async def post_shutdown(application: Application) -> None:
+    logger.info("Bot shutting down")
+
+
+def main() -> None:
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CallbackQueryHandler(callback_query_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    logger.info("Starting PocoAPoco bot (polling)...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
