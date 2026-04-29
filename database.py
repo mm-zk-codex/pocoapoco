@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
     spanish_ratio REAL DEFAULT 0.15,
     interests TEXT DEFAULT '[]',
     daily_time TEXT DEFAULT '08:00',
+    daily_time_set INTEGER NOT NULL DEFAULT 0,
     timezone TEXT DEFAULT 'UTC',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_active TIMESTAMP
@@ -39,6 +40,13 @@ async def init_db():
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(CREATE_USERS_TABLE)
         await db.execute(CREATE_CONVERSATIONS_TABLE)
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "daily_time_set" not in cols:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN daily_time_set INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migration: added users.daily_time_set")
         await db.commit()
     logger.info("Database initialized")
 
@@ -76,7 +84,7 @@ async def update_user_interests(telegram_id: int, interests_json: str):
 async def update_user_daily_time(telegram_id: int, daily_time: str):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
-            "UPDATE users SET daily_time = ? WHERE telegram_id = ?",
+            "UPDATE users SET daily_time = ?, daily_time_set = 1 WHERE telegram_id = ?",
             (daily_time, telegram_id),
         )
         await db.commit()
@@ -119,7 +127,8 @@ async def get_users_for_time(current_time: str) -> list[dict]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE daily_time = ?", (current_time,)
+            "SELECT * FROM users WHERE daily_time = ? AND daily_time_set = 1",
+            (current_time,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

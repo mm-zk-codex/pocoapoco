@@ -243,12 +243,28 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     stats = await get_user_stats(telegram_id)
     name = db_user.get("first_name") or "amigo"
 
+    interests = json.loads(db_user.get("interests") or "[]")
+    daily_time_set = bool(db_user.get("daily_time_set"))
+    daily_time = db_user.get("daily_time") if daily_time_set else None
+
+    if interests:
+        interests_line = f"Topics: {', '.join(interests)}"
+    else:
+        interests_line = "Topics: <i>not set yet</i> — type /setup to pick"
+    if daily_time:
+        daily_line = f"Daily check-in: {daily_time}"
+    else:
+        daily_line = "Daily check-in: <i>not set yet</i> — type /setup to pick"
+
     if stats["total_user_messages"] == 0:
-        await update.message.reply_text(
+        lines = [
             f"¡Hola, {name}! No <b>conversaciones</b> yet — say something and "
             "your stats will start filling up. 🌱",
-            parse_mode="HTML",
-        )
+            "",
+            interests_line,
+            daily_line,
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
     streak = stats["streak"]
@@ -268,9 +284,54 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Messages sent: {stats['total_user_messages']}",
         f"Spanish <b>palabras</b> you've seen: {stats['spanish_words_seen']}",
         "",
+        interests_line,
+        daily_line,
+        "",
         "¡Sigue así! Keep going. 🌱",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def setup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    telegram_id = tg_user.id
+
+    db_user = await get_user(telegram_id)
+    if db_user is None:
+        await update.message.reply_text(
+            "You'll need an invite to chat first. Send "
+            "<code>/start your-invite-code</code> to join.",
+            parse_mode="HTML",
+        )
+        return
+
+    interests_unset = (db_user.get("interests") or "[]") == "[]"
+    if interests_unset:
+        context.user_data["pending_interests"] = []
+        context.user_data["setup_shown"] = True
+        await update.message.reply_text(
+            "What topics would you like to chat about? Pick as many as you like!",
+            reply_markup=_interests_keyboard([]),
+        )
+        return
+
+    if not db_user.get("daily_time_set"):
+        await update.message.reply_text(
+            "When should I message you each day for our <b>conversación</b>?",
+            reply_markup=_time_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    interests = json.loads(db_user.get("interests") or "[]")
+    daily_time = db_user.get("daily_time")
+    await update.message.reply_text(
+        "You're all set! Topics: <b>"
+        + ", ".join(interests)
+        + f"</b>. Daily check-in at <b>{daily_time}</b>.\n"
+        "Type /stats to see your progress.",
+        parse_mode="HTML",
+    )
 
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,6 +406,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("stats", stats_handler))
+    app.add_handler(CommandHandler("setup", setup_handler))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
